@@ -433,7 +433,7 @@ ROC is created over the course of the model learning. It is used to see how good
 
 Estimating movie profit is a challenging problem that involves many moving pieces. Our data provided up to 80% accuracy, however our dataset was about 76% profitable movies already, which may have affected our models. Furthermore, the profit of a movie obviously cannot be predicted with just the budget and popularity, as many more complex variables regarding merchandising, marketing and actor status affect its success. However we have proved that we can get a close estimate using different machine learning models. 
 
-Thank for reading!
+Thanks for reading!
 
 <br></br>
 <br></br>
