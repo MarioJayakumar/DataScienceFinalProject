@@ -1,0 +1,439 @@
+---
+title: ""
+author: ""
+date: ""
+output: 
+  html_document
+---
+
+```{r knitr_setup, echo=FALSE}
+knitr::opts_chunk$set(cache=TRUE)
+```
+
+<center> <h1>Analysis of IMDB5000</h1> </center>
+<center> <h3>By Mario Jayakumar</h3> </center>
+<center> <h3>CMSC320 Final Project</h3> </center>
+<center> <img src="http://dailyrunneronline.com/wp-content/uploads/2014/02/o-THEATER-SEATS-facebook.jpg" style="width:50%;height:50%;"> </center>
+<center><a href="http://dailyrunneronline.com/wp-content/uploads/2014/02/o-THEATER-SEATS-facebook.jpg&#10;"><sub> Image Source </sub></a></center>
+
+
+## Preface
+
+The data that we are going to analyze is the TMDB5000, which can be [found here on kaggle](https://www.kaggle.com/tmdb/tmdb-movie-metadata/data). The entire code for this analysis is [also availabe here.](https://github.com/MarioJayakumar/DataScienceFinalProject) This dataset has almost 5000 rows containing information about different movies like budget, revenue, crew and much more. The reason that we are going to analyze this data set is to possibly predict the profit of a movie base on its different attributes. When exploring movie possibilities, it would be useful to determine if a movie idea would even be profitable to make. We will use machine learning techniques to use attributes from the data set to predict this. 
+
+## Environment Setup
+
+This jumble of import statements show all the libraries used in analyzing this data set. Some are used to analyze the dataset, while others are added to make the data more appealing. 
+
+```{r library, warning=FALSE}
+#data manipulation
+library(tidyverse)
+library(jsonlite)
+
+#aesthetics
+library(scales)
+library(ggrepel)
+library(ggthemes)
+library(broom)
+library(gridExtra)
+library(ellipse)
+
+#learning models
+library(caret)
+library(rpart.plot)
+library(e1071)
+library(plotROC)
+
+```
+ 
+## Accessing and Viewing the Data 
+ 
+Once the data is downloaded, they can easily be read. They are both csv files so they can be read with read_csv.
+
+```{r loadset, warning=FALSE,message=FALSE}
+movie_data <- read_csv("data/tmdb_5000_movies.csv")
+movie_credits <- read_csv("data/tmdb_5000_credits.csv")
+```
+
+The dataset actually contains two CSVs, one regarding the data about a movie, and the other regarding the credits data about the movie. You can view them like this:
+
+```{r}
+cat("Movies: \n ",attributes(movie_data)$names, sep = "\t")
+cat("Credits: \n ",attributes(movie_credits)$names, sep = "\t")
+```
+
+Let's create a histogram of budgets, so that we can see the distribution of budgets and what is the most common range. We draw a vertical red line at the median budget. 
+
+```{r}
+movie_data %>%
+  ggplot(aes(budget)) + geom_histogram(bins=60) +
+  geom_vline(aes(xintercept=median(budget)), color="red") + ggtitle("Distribution of Movie Budgets") + xlab("Budgets") + ylab("Frequency") + scale_x_continuous(labels = scales::dollar) + theme_gdocs()
+```
+
+The distribution of budgets appears to be skewed right. We can see that there is a large amount of movies with a budget of 0, which is odd since movies cannot be made without a budget. We will then create a histogram filtering out the movies with a low budget, to get a more realistic idea of the spread. The low budgets recorded are most likely an error made when creating the data; a 30 million budget may have been written as 30, for example. Therefore it is safer to just remove all of the movies below a reasonable threshold. 
+
+```{r}
+movie_data %>%
+  filter(budget > 5000) %>%
+  ggplot(aes(budget)) + geom_histogram(bins=60) +
+  geom_vline(aes(xintercept=median(budget)), color="red") + ggtitle("Clean Distribution of Movie Budgets") + xlab("Budgets") + ylab("Frequency") + scale_x_continuous(labels = scales::dollar) + theme_gdocs()
+```
+
+
+We can see that now the histogram is still skewed right, but is not dominated by zeros as much as before. This can be applied to revenue is well, since it is more than likely that the data is incorrect and should be removed, rather than the movie having made no money at all. We will filter out both of these cases from the data set. However we will only do this after extracting some more data from movie credits. 
+
+## Processing Multiple Datasets
+
+Only picking necessary columns from movie_data so it is not so crowded. We will not be using these for the rest of the analysis. 
+
+```{r selectData}
+movie_data <- movie_data %>%
+  select(budget,id,genres, original_title, popularity, production_companies, revenue, vote_average, keywords)
+```
+
+Each movie has its own unique ID to identify it. We can use this when working between the two datasets, since the movie name is not stored in credits. To start off our exploratory data analysis, we can compare directors and see which ones are the most successful. The only problem is, movie_data doesn't have that as an attribute. Furthermore, movie_credit has it stored as a json within the crew attribute. The only way to get director is to then parse each json, and mutate that to the movie_data. Another reason we are doing this is because lots of attributes in both data sets are stored as JSONs, so we need to see how we can extract data when we need it. 
+
+
+```{r}
+extract_director <- function(json) {
+  #If the JSON is empty return NA for the director
+  if (json == "[]") {
+    return(NA)
+  }
+  else
+  {
+    #convert element from JSON to dataframe
+    #filter for the director job and select the director name
+    test <- fromJSON(json) %>%
+      filter(job=="Director") %>%
+      select(name)
+    #nrow(test) yields 0 if director was not found
+    if (nrow(test) == 0) {
+      return(NA)
+    }
+    else {
+      return(test$name[[1]])
+    }
+  }
+}
+
+#initializing an empty vector
+director <- vector(mode="character",length = nrow(movie_credits))
+#filling vectors with directors. Order is still maintained, so we can just add it on. 
+for (i in 1:nrow(movie_credits)){
+  director[i] = extract_director(movie_credits$crew[i])
+}
+
+movie_data <- movie_data %>%
+  mutate(directed = director)
+```
+
+Lets modify a 'superhero' attribute to each movie, where if it is a super hero movie we add a boolean value to it. We will use the same method used for directors to extract this value. The keywords attribute in movie_data has "superhero" if it is infact a superhero movie. This will be used to identify them. 
+
+```{r}
+extract_superhero <- function(json) {
+  if (json == "[]") {
+    return(FALSE)
+  }
+  else
+  {
+    #filtering for the superhero keyword
+    test <- fromJSON(json) %>%
+      filter(name=="superhero")
+    if (nrow(test) == 0) {
+      return(FALSE)
+    }
+    else {
+      return(TRUE)
+    }
+  }
+}
+
+superhero_list <- vector(mode="logical",length = nrow(movie_data))
+for (i in 1:nrow(movie_data)){
+  superhero_list[i] = extract_superhero(movie_data$keywords[i])
+
+#mutating this to dataset
+movie_data <- movie_data %>%
+  mutate(is_superhero = superhero_list)
+}
+```
+
+Now we extract genre. This is similar to all the other ones, except a movie can have multiple genres. We are only going to keep track of action, adventure, fantasy, scifi, drama and comedy. We will keep these on as logical attributes, so if a movie has multiple genres it will be true for those respective attributes. 
+
+```{r}
+extract_genre <- function(json) {
+  #if json empty then return false across all genres
+  if (json == "[]") {
+    return(c(FALSE, FALSE, FALSE, FALSE, FALSE, FALSE))
+  }
+  else
+  {
+    test <- fromJSON(json)
+    action = FALSE
+    adventure = FALSE
+    fantasy = FALSE
+    scifi = FALSE
+    drama = FALSE
+    comedy = FALSE
+    #preparing tuple to return representing each genre
+    if (nrow(test %>% filter(name=="Action")) > 0){ action = TRUE }
+    if (nrow(test %>% filter(name=="Adventure"))  > 0){ adventure = TRUE }
+    if (nrow(test %>% filter(name=="Fantasy")) > 0){ fantasy = TRUE }
+    if (nrow(test %>% filter(name=="Science Fiction")) > 0){ scifi = TRUE }
+    if (nrow(test %>% filter(name=="Drama")) > 0){ drama = TRUE }
+    if (nrow(test %>% filter(name=="Comedy")) > 0){ comedy = TRUE }
+    val = c(action, adventure, fantasy, scifi, drama, comedy)
+    return(val)
+  }
+}
+
+action_list <- vector(mode="logical",length = nrow(movie_data))
+adventure_list <- vector(mode="logical",length = nrow(movie_data))
+fantasy_list <- vector(mode="logical",length = nrow(movie_data))
+scifi_list <- vector(mode="logical",length = nrow(movie_data))
+drama_list <- vector(mode="logical",length = nrow(movie_data))
+comedy_list <- vector(mode="logical",length = nrow(movie_data))
+for (i in 1:nrow(movie_data)){
+  #a tuple is returned of the form (action, adventure, fantasy, scifi, drama, comedy)
+  temp = extract_genre(movie_data$genres[i])
+  action_list[i] = temp[1]
+  adventure_list[i] = temp[2]
+  fantasy_list[i] = temp[3]
+  scifi_list[i] = temp[4]
+  drama_list[i] = temp[5]
+  comedy_list[i] = temp[6]
+}
+
+#mutating these to our movie_data set
+movie_data <- movie_data %>%
+  mutate(action = action_list) %>%
+  mutate(adventure = adventure_list) %>%
+  mutate(fantasy = fantasy_list) %>%
+  mutate(scifi = scifi_list) %>%
+  mutate(drama = drama_list) %>%
+  mutate(comedy = comedy_list)
+```
+
+## Cleaning the Data
+
+We are done extracting all the data we want for our analysis, so we can begin to remove the unclean data. As a threshold, if a movie made less than or was made with less than $5000, it was most likely a mistake. In any case, it will not hurt our analysis. 
+
+```{r}
+movie_data <- movie_data %>%
+  filter(budget > 5000) %>%
+  filter(revenue > 5000)
+```
+
+## Exploratory Data Analysis
+
+The most interesting aspect of the movie data is how money much a movie made. While revenue indicates the gross income of the movie, we have to account for the budget of the movie. So we can mutate profit to the data set, which is $revenue - budget$. 
+
+```{r}
+movie_data <- movie_data %>%
+  mutate(profit = revenue - budget)
+```
+
+We also want to keep track of a logical analogy for the profit. Basically, if the profit was greater than 0, it was profitable. If not then the movie was not profitable. This will be useful when doing predictions later. 
+
+```{r}
+movie_data <- movie_data %>%
+  mutate(profitable = ifelse(profit > 0, TRUE, FALSE))
+```
+
+
+We can extract the proportion of profitable and unprofitable films using the summary method. First we group by profitability then we summarize by number of elements. We convert to matrix so that we can access elements via indices. 
+
+```{r}
+summary_data <- movie_data %>%
+  group_by(profitable) %>%
+  summarize(num = n()) %>%
+  ungroup()
+summary_data <- as.matrix(summary_data)
+
+profitable_trues <- summary_data[,2][2] 
+proportion <- (profitable_trues)/(profitable_trues + summary_data[,2][1])
+cat("Proportion of Profitable Movies: ",proportion)
+```
+
+From this we can see that about 75.7% of all movies are profitable. 
+
+### Best Directors
+
+Now we begin our exploratory data analysis. We first group by directors, so that we can perform analysis on each director. We then filter for the max profit movie for each director, and then ungroup the data. We can order the data in highest to lowest, then take the top 10 directors. After that, we rearrange the factors in reverse order so that when we plot it, it looks in order. Finally, we plot the data with labels. *ggrepel is used for the labels so it looks prettier*
+
+```{r}
+director_graph <- movie_data %>%
+  group_by(directed) %>%
+  filter(profit==max(profit)) %>%
+  ungroup() %>%
+  arrange(desc(profit)) %>%
+  slice(1:10)
+
+director_graph$directed <- factor(director_graph$directed, rev(as.character(director_graph$directed)))
+
+director_graph %>%
+  ggplot(aes(y=directed, x=revenue)) + geom_point() + ggtitle("Top 10 Highest Grossing Directors") + ylab("Director") + xlab("Profit") + scale_x_continuous(labels = scales::dollar) + geom_label_repel(aes(label=original_title)) + theme_gdocs()
+```
+
+
+### Superhero Movie Profitability
+
+Now we do some quick visualization on superhero and non-superhero movies. We can graph the distributions of profit for superhero and non-superhero movies. We use geom_violin to show distributions. 
+
+```{r}
+movie_data %>%
+  ggplot(aes(y=profit, x=is_superhero)) + geom_violin() + theme_gdocs() + ggtitle("Profit Distribution of Superhero Movies") + ylab("Profit") + xlab("Superhero Movie")
+```
+
+ From this graph, we can see that both superhero and non-superhero films have a peak at about zero profit. However, superhero films seem to be less centered around zero, indicating that they are more profitable. However, it is unlikely that this will be useful for a predictor, since they are so close together. 
+ 
+### Genre Comparison
+ 
+ We can now graph some aspects of genre. For each genre, we can do something similar to what we did for profit: create a distribution of profit for genre and "non-genre" films. Since we want to compare across genres, we place each graph in a grid so that they are easier to analyze. 
+
+```{r}
+p1 <- movie_data %>% 
+  ggplot(aes(x=action, y = profit)) + geom_violin()  + xlab("Action") + ylab("Profit")
+p2 <- movie_data %>% 
+  ggplot(aes(x=adventure, y = profit)) + geom_violin()  + xlab("Adventure") + ylab("Profit")
+p3 <- movie_data %>% 
+  ggplot(aes(x=fantasy, y = profit)) + geom_violin()  + xlab("Fantasy") + ylab("Profit")
+p4 <- movie_data %>% 
+  ggplot(aes(x=scifi, y = profit)) + geom_violin()  + xlab("Science Fiction") + ylab("Profit")
+p5 <- movie_data %>%
+  ggplot(aes(x=drama, y = profit)) + geom_violin()  + xlab("Drama") + ylab("Profit")
+p6 <- movie_data %>% 
+  ggplot(aes(x=comedy, y = profit)) + geom_violin()  + xlab("Comedy") + ylab("Profit")
+grid.arrange(p1,p2,p3,p4,p5,p6, nrow=2, top = "Profit Distributions of Different Genres")
+```
+
+Just like superhero, almost all genres are centered around 0. Action, adventure and fantasy are all slightly spread apart from zero, but not significantly. Therefore, most of these will not be able to be used for a predictor. 
+
+### Feature Plot
+
+
+To succinctly view what attributes of our data are useful for predicting profitability, we can use a density plot to compare them. The library caret has a function called featurePlot that allows us to create multiple density plot for certain features. More can be read about density plots [at this link](https://datavizcatalogue.com/methods/density_plot.html]) . For the density plot to work, we need the features to be numeric. That is, logicals like true and false must be converted to 1 or 0, where 1 represents true and 0 represents false. We also have to make our predicted variable, _profitable_, a factor of true and false. So first we select the attribute we want from the data frame, and then we convert them.
+
+In our featurePlot function call there are many different arguments. x represents our different features that we want to plot. y represents the variable we are trying to predict, in this case profitability. The scales are used to make the graphs easier to read, since the lack of them would make the graphs very hard to interpret. PCH is the point used for plotting, so we use a simple "." to represent points. Adjust changes the smoothness of the curves, where the higher the adjust value the more smooth each plot is. Finally, auto.key simply changes the aesthetics of the graph. More can be read about [feature plots here.](https://www.rdocumentation.org/packages/caret/versions/6.0-79/topics/featurePlot) 
+
+```{r}
+final_set <- movie_data %>%
+  select(-id, -genres, -original_title, -production_companies, -directed, -keywords, -revenue, -profit)
+final_set$budget <- as.numeric(final_set$budget)
+final_set$popularity <- as.numeric(final_set$popularity)
+final_set$vote_average <- as.numeric(final_set$vote_average)
+final_set$is_superhero <- as.numeric(final_set$is_superhero)
+final_set$action <- as.numeric(final_set$action)
+final_set$adventure <- as.numeric(final_set$adventure)
+final_set$fantasy <- as.numeric(final_set$fantasy)
+final_set$scifi <- as.numeric(final_set$scifi)
+final_set$drama <- as.numeric(final_set$drama)
+final_set$comedy <- as.numeric(final_set$comedy)
+final_set$profitable <- as.factor(final_set$profitable)
+
+featurePlot(x=final_set[,1:10], y=final_set$profitable, plot="density",
+            scales = list(x = list(relation="free"), y = list(relation="free")), 
+            pch = ".", 
+            adjust = 1.1, 
+            layout = c(4, 3), 
+            auto.key = list(columns = 2, rows=2 , lines=TRUE))
+```
+
+Each graph represents the probability of success at a certain value. A peak means high probability at that specific value. Profitable and unprofitable are represented by different colors, but if we want features that distinguish them we want the peaks to occur at different values. If they peak for the same values, then that feature won't be useful in predicting profitability, since it won't be able to distinguish between profitable and unprofitable. Just like we expected, all the genres hve peaks at the same values so they won't be useful in predicting. is_superhero also peaks at the same value, so it also won't be useful. From this graph, we can see that budget and popularity can be useful for predicting profitability. 
+
+
+## Data Prediction
+
+Now that we have an idea of what features are important, we can try using them to predict the profit of the movie. The first method we will use is a decision tree. A decision tree represents different paths that can be taken, based on given information. Each fork in the tree represents a different decision to be made, based on feature probability; each leaf represents the final classification based on the input. So if we reach a fork that says to go right if our budget is greater than \$10 million, and the test budget is \$5 million, then we would end up going right. This is created using recursive algorithms, where sections of the data are recursively partitioned on till we have a tree of desired length. The algorithms behind creating these trees are further [expanded on here.](https://towardsdatascience.com/decision-trees-in-machine-learning-641b9c4e8052)
+
+To create a decision tree we have to give it data to train on. We could give it our entire data set, but then we would have no way of testing it. If we train a certain model, it may be able to perfectly predict everything that it was trained for, but nothing outside that subset. Therefore we need to provide a testing set to evaluate our model, which we take out of our data set. This technique is called [cross validation.](https://towardsdatascience.com/cross-validation-in-machine-learning-72924a69872f) We partition our data set into 80% and 20%, where the larger partition is used for training.
+
+```{r dataPartioning}
+set.seed(1337)
+prediction_set <- movie_data %>%
+  select(-id, -genres, -original_title, -production_companies, -directed, -keywords, -revenue, -profit)
+index <- createDataPartition(y=prediction_set$profitable, p=0.8, list=FALSE)
+
+data_train <- prediction_set[index,]
+data_test <- prediction_set[-index,]
+```
+
+### Decision Tree
+
+RPart is the library we are using to create the decision tree. We already decided before that budget, population and vote_average would be used to predict profitability, so we use that for our equation. Our data is from the data_train partition we created and our method is classification of probability, or class for short. With all those parameters, we can build a tree.
+
+We call predict() to actually call our tree on our test set. It returns the probability of the provided data being True or False. We convert this to true if the "true percentage" is greater than or equal to 50, and false otherwise. Finally we create a confusion matrix to view the acutal performance of our model on the test set. 
+
+```{r treeModel}
+decision_tree <- rpart(profitable~budget+popularity, data=data_train, method="class")
+predictions_decision <- predict(decision_tree, data_test)
+predictions_decision <- factor(ifelse(predictions_decision[,2]>0.5, TRUE, FALSE))
+data_test$profitable <- factor(data_test$profitable)
+confusionMatrix(predictions_decision, data_test$profitable)
+```
+The confusion matrix at the top shows observed/reference Ts and Fs versus the Predicted Ts and Fs. The biggest problem is that 149 falses were predicted true. However, the accuracy of the model was 81% which is not too bad. On the other hand, our original percentage of profitable movies was 75%, so if we guessed everything as True for this sample we would have observed something close to that. Let's graph our tree using prp just to see what it looks like.
+
+```{r}
+rpart.plot(decision_tree, cex = 0.8)
+```
+
+### 10-fold Cross Validation
+
+Let's see if we can improve that accuracy by using a different cross validation. We can now try a 10-fold cross validation. This involves splitting the data into k partitions, where we train on (k-1) partitions and test on 1 partition. We repeat this so that every partition is tested on once. [This article](https://en.wikipedia.org/wiki/Cross-validation_(statistics)#k-fold_cross-validation) further expands on how k-fold cross validation works and why it is done. 
+
+We are going to use caret to do this, so there are some variables we have to create first. We create train_control to define that we want a cross validation with 10 folds over the data. We then create the decision tree calling caret::train(). We define the entire prediction set into the method, along with the train control we defined. We also specify rpart as the method, so that we create a decision tree. The method requires the "y" value is a factor, so we factor it before we begin. 
+
+We also define tuneLength to be 10; tuneLength affects how long our tree will be built to, so we use a value that grows a tree similar to our last tree. 
+
+```{r bigTreeModel}
+prediction_set$profitable <- factor(prediction_set$profitable)
+train_control <- trainControl(method="cv", number=10)
+tree_fit <- train(profitable~budget+popularity, data=prediction_set, method="rpart", trControl=train_control, tuneLength=10)
+tree_fit
+```
+Our accuracy is now 79% which is unfortunately worse than we got before. We can plot the tree to see what it looks like. 
+
+```{r}
+rpart.plot(tree_fit$finalModel, cex=0.8)
+```
+
+### Random Forests
+
+
+Another method we can try is random forests. A random forest is basically a bunch of decision trees merged together. Each tree is grown by selecting a random number of features, and then the average between trees is found. There is more information about [Random Forests here.](https://towardsdatascience.com/the-random-forest-algorithm-d457d499ffcd)
+
+Creating this is very similar to the previous tree, since caret makes the steps much simpler. We send in all the features since the random forest will randomly pick them, and we use the same data set. We set our method to rf for random forests, and we create a new train control to save predictions. This will be useful for analysis after the training is done. 
+
+```{r}
+prediction_set$profitable <- ifelse(prediction_set$profitable == TRUE, "T", "F")
+forest_control <- trainControl(method="cv", classProbs = TRUE, savePredictions = TRUE)
+forest_fit <- train(profitable~., data=prediction_set, method="rf", trControl=forest_control)
+forest_fit
+```
+
+Here we can see that two predictors maximize the accuracy, which is what we saw before; budget and popularity are the best features for predicting. At those 2 features, the accuracy was 79.8% which is higher than what we had for the 10-fold cv decision tree. 
+
+We can graph a [Receiver Operating Characteristic (ROC)](https://en.wikipedia.org/wiki/Receiver_operating_characteristic) curve. An ROC curve plots the rate of True Positive Rate vs False Positive Rate during the training of the model. The True Positive rate is the proportion of correctly predicted positive to the proportion of correctly predicted negatives. 
+
+```{r warning=FALSE}
+indices <- forest_fit$pred$mtry == 2
+
+roc<- ggplot(forest_fit$pred[indices, ], 
+       aes(m = T, d = factor(obs, levels = c("T", "F")))) + 
+    geom_roc(hjust = -0.4, vjust = 1.5) + geom_abline(slope=1) + coord_equal() +  theme_gdocs() + ggtitle("ROC Curve for Random Forest") + xlab("False Positive Rate") + ylab("True Positive Rate")
+
+roc + annotate("text", x=0.75, y=0.25, label=paste("AUC =", round((calc_auc(roc))$AUC, 4)))
+```
+
+ROC is created over the course of the model learning. It is used to see how good our model is at predicting the data. The closer the curve is to the top left, the better the model it is. That being said, the closer the area under the curve (AUC) is to 1, then the better the model is. On the other hand, the closer the ROC is to the diagonal line in the middle, the worse it is. Our curve seems to be better than the middle, and the ROC is 0.795 which is not too bad. However, it is clearly not a perfect model. 
+
+
+## Conclusion
+
+Estimating movie profit is a challenging problem that involves many moving pieces. Our data provided up to 80% accuracy, however our dataset was about 76% profitable movies already, which may have affected our models. Furthermore, the profit of a movie obviously cannot be predicted with just the budget and popularity, as many more complex variables regarding merchandising, marketing and actor status affect its success. However we have proved that we can get a close estimate using different machine learning models. 
+
+Thank for reading!
+
+<br></br>
+<br></br>
